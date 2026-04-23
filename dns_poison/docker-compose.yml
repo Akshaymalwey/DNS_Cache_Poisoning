@@ -1,0 +1,97 @@
+version: "3.9"
+
+# ┌─────────────────────────────────────────────────────────────────────┐
+# │  DNS Cache Poisoning Lab — Docker Compose                          │
+# │                                                                     │
+# │  Network: 10.0.0.0/24                                              │
+# │    10.0.0.2  resolver    (caching DNS, fixed upstream port 5300)   │
+# │    10.0.0.3  auth_server (authoritative, 200ms artificial delay)   │
+# │    10.0.0.4  victim      (queries resolver every 5s)               │
+# │    10.0.0.5  attacker    (raw-socket Kaminsky flood)                │
+# └─────────────────────────────────────────────────────────────────────┘
+
+networks:
+  dns_lab:
+    driver: bridge
+    ipam:
+      config:
+      
+        - subnet: 10.0.0.0/24
+
+services:
+
+  # ── Authoritative DNS server ──────────────────────────────────────────
+  auth_server:
+    build: ./auth_server
+    container_name: auth_server
+    networks:
+      dns_lab:
+        ipv4_address: 10.0.0.3
+    environment:
+      - LISTEN_PORT=53
+      - ARTIFICIAL_DELAY_MS=1000   # ← increase this to make attack easier
+    cap_add:
+      - NET_BIND_SERVICE
+    restart: unless-stopped
+
+  # ── Caching resolver ──────────────────────────────────────────────────
+  resolver:
+    build: ./resolver
+    container_name: resolver
+    networks:
+      dns_lab:
+        ipv4_address: 10.0.0.2
+    environment:
+      - LISTEN_PORT=53
+      - AUTH_IP=10.0.0.3
+      - AUTH_PORT=53
+      - UPSTREAM_PORT=5300        # fixed port — the intentional vulnerability
+    cap_add:
+      - NET_BIND_SERVICE
+    depends_on:
+      - auth_server
+    restart: unless-stopped
+
+  # ── Victim ────────────────────────────────────────────────────────────
+  victim:
+    build: ./victim
+    container_name: victim
+    networks:
+      dns_lab:
+        ipv4_address: 10.0.0.4
+    environment:
+      - RESOLVER_IP=10.0.0.2
+      - RESOLVER_PORT=53
+      - TARGET_DOMAIN=evil.example.com
+      - QUERY_INTERVAL=5
+    depends_on:
+      - resolver
+    restart: unless-stopped
+
+  # ── Attacker ──────────────────────────────────────────────────────────
+  attacker:
+    build: ./attacker
+    container_name: attacker
+    networks:
+      dns_lab:
+        ipv4_address: 10.0.0.5
+    environment:
+      - RESOLVER_IP=10.0.0.2
+      - RESOLVER_PORT=53
+      - UPSTREAM_PORT=5300        # must match resolver's UPSTREAM_PORT
+      - AUTH_IP=10.0.0.3
+      - VICTIM_IP=10.0.0.4
+      - TARGET_DOMAIN=evil.example.com
+      - MALICIOUS_IP=6.6.6.6     # the IP we want to poison into cache
+      - FLOOD_THREADS=4
+      - TXID_CHUNK=200
+      - ROUND_DELAY=0.05
+      - MAX_ROUNDS=50
+    # Raw sockets require elevated privileges — ONLY acceptable in a lab
+    privileged: true
+    cap_add:
+      - NET_RAW
+      - NET_ADMIN
+    depends_on:
+      - resolver
+    restart: "no"                 # run once; comment out to keep retrying
